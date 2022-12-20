@@ -1,15 +1,62 @@
 program game_of_life
+    use mpi_f08
     implicit none
+    
+    ! Variables
     integer :: height, width
     integer :: max_gen, gen
+    integer :: n_ranks, my_rank, root, north_rank, south_rank, east_rank, west_rank
+    integer :: n_rows, n_cols, row, col
+    integer :: ib, ie, jb, je
     logical, dimension(:, :), pointer :: old_world, new_world, tmp_world
+    type(MPI_Datatype) :: a_row, a_col
+    type(MPI_Status) :: status
 
-    read *, height, width, max_gen !, n_rows, n_cols
-    allocate(old_world(0:height + 1, 0:width + 1))
-    allocate(new_world(0:height + 1, 0:width + 1))
-    call read_map( old_world, height, width )
-    call update_borders( old_world, height, width )
+    ! Initializing MPI
+    call MPI_Init()
+    call MPI_Comm_rank( MPI_COMM_WORLD, my_rank)
+    call MPI_Comm_size( MPI_COMM_WORLD, n_ranks)
 
+    ! Setting root rank to 0 and checking ranks to processes
+    root = 0
+    if (my_rank == root) then
+        read *, height, width, max_gen, n_rows, n_cols
+
+        !error message when number of processes != number of subgrids
+        if ((n_rows * n_cols) /= n_ranks) then
+            print "(a)", "Incorrect number of processes"
+            call MPI_Abort( MPI_COMM_WORLD, MPI_ERR_TOPOLOGY )
+        end if
+    end if
+
+    ! Broadcasting n_rows, n_cols, height, width & max_gen
+    call MPI_Bcast(n_rows, 1, MPI_INTEGER, root, MPI_COMM_WORLD)
+    call MPI_Bcast(n_cols, 1, MPI_INTEGER, root, MPI_COMM_WORLD)
+    call MPI_Bcast(height, 1, MPI_INTEGER, root, MPI_COMM_WORLD)
+    call MPI_Bcast(width, 1, MPI_INTEGER, root, MPI_COMM_WORLD)
+    call MPI_Bcast(max_gen, 1, MPI_INTEGER, root, MPI_COMM_WORLD)
+
+    ! Getting coordinates for current rank
+    call get_coords(my_rank, n_rows, n_cols, row, col)
+
+    ! Setting rank neighbours
+    north_rank = get_rank( row - 1, col,     n_rows, n_cols )
+    south_rank = get_rank( row + 1, col,     n_rows, n_cols )
+    west_rank  = get_rank( row,     col - 1, n_rows, n_cols )
+    east_rank  = get_rank( row,     col + 1, n_rows, n_cols )
+
+    ! Partitioning gid in subgrids
+    call partition( row, n_rows, height, ib, ie )
+    call partition( col, n_cols,  width, jb, je )
+
+    ! Allocating world map variables
+    allocate(old_world(ib - 1:ie + 1, jb - 1:je + 1))
+    allocate(new_world(ib - 1:ie + 1, jb - 1:je + 1))
+
+    ! Defining MPI types
+
+
+    !Actual Game of Life
     do gen = 1, max_gen
         print "(a, i0)", "Generation ", gen
         call print_map( old_world, height, width )
@@ -21,8 +68,14 @@ program game_of_life
         tmp_world => old_world;  old_world => new_world;  new_world => tmp_world
     end do
 
+    !Cleaning memory from worlds
     if (associated( old_world )) deallocate(old_world)
     if (associated( new_world )) deallocate(new_world)
+
+    !Finallizing MPI
+    call MPI_Type_free(a_row)
+    call MPI_Type_free(a_col)
+    call MPI_Finalize()
 
 contains
 
@@ -116,5 +169,17 @@ contains
         ! Clear the terminal screen using console escape code ^[2J.
         print "(2a)", achar( 27 ), '[2J'
     end subroutine wait_cls
+
+    ! Divides 2D grid in the closest to equal subgrids
+    subroutine partition( id, n_ids, size, b, e )
+        integer, intent(in)    :: id, n_ids, size
+        integer, intent(inout) :: b, e
+        integer :: remainder, quotient
+
+        remainder = modulo( size, n_ids )
+        quotient  = (size - remainder) / n_ids
+        b = 1 + quotient * (id    ) + min( remainder, id     )
+        e =     quotient * (id + 1) + min( remainder, id + 1 )
+    end subroutine partition
 
 end program game_of_life
