@@ -1,5 +1,5 @@
 program game_of_life
-    use mpi_f08
+    use :: mpi_f08
 
     implicit none
     
@@ -8,6 +8,7 @@ program game_of_life
     integer :: max_gen, gen
     integer :: n_ranks, my_rank, root, north_rank, south_rank, east_rank, west_rank
     integer :: n_rows, n_cols, row, col, ib, ie, jb, je
+    logical :: still_flag
     logical, dimension(:, :), pointer :: old_world, new_world, tmp_world
     type(MPI_Comm) :: comm
     type(MPI_Datatype) :: a_row, a_col
@@ -18,7 +19,7 @@ program game_of_life
     call MPI_Comm_rank( comm, my_rank)
     call MPI_Comm_size( comm, n_ranks)
 
-    ! Setting root rank to 0 and checking ranks to processes
+    ! Setting root rank to 0 and reading in root
     root = 0
     if (my_rank == root) read *, height, width, max_gen, n_rows, n_cols
 
@@ -80,10 +81,10 @@ program game_of_life
         call next_gen(old_world, new_world)
         !updating borders
         call update_borders(new_world)
-        !if (my_rank == root) call wait_cls(100)
         !aborting if world is still
+        still_flag = world_is_still( old_world, new_world )
         call MPI_Bcast(world_is_still( old_world, new_world ), 1, MPI_LOGICAL, root, comm)
-        if (world_is_still( old_world, new_world )) exit
+        if (still_flag) exit
         !swapping new map to old map
         tmp_world => old_world;  old_world => new_world;  new_world => tmp_world 
     end do
@@ -100,9 +101,9 @@ program game_of_life
 contains
 
     function world_is_still( old_map, new_map ) result(still)
-        logical, dimension(:, :), pointer, intent(in) :: old_map, new_map
-        logical :: still
-        logical, dimension(n_ranks)                   :: all_is_still
+        logical, dimension(:, :), pointer, intent(in)   :: old_map, new_map
+        logical                                         :: still
+        logical, dimension(n_ranks)                     :: all_is_still
 
         still = all( old_map .eqv. new_map )
         call MPI_Gather(still, 1, MPI_LOGICAL, all_is_still,   1, MPI_LOGICAL, root, comm)
@@ -174,21 +175,21 @@ contains
         character(len=:), allocatable :: line       ! variable to hold a line
         logical,          allocatable :: temp(:)    ! temporary array to hold a portion of the line
         integer :: i, j, rb, re, cb, ce             ! indices for looping
-        integer :: current_row, current_col, dst    ! variables for holding partition info
+        integer :: row_, col_, dst                  ! variables for holding partition info
         
         ! root reads map
         if (my_rank == root) then
             allocate(character(len=w) :: line)
-            do current_row = 0, n_rows - 1
-                call partition(current_row, n_rows, h, rb, re)
+            do row_ = 0, n_rows - 1
+                call partition(row_, n_rows, h, rb, re)
                 ! loop over the rows
                 do i = rb, re
                     ! read in a line
                     read *, line
                     ! loop over the columns
-                    do current_col = 0, n_cols - 1
-                        call partition(current_col, n_cols, w, cb, ce)
-                        dst = get_rank(current_row, current_col, n_rows, n_cols)
+                    do col_ = 0, n_cols - 1
+                        call partition(col_, n_cols, w, cb, ce)
+                        dst = get_rank(row_, col_, n_rows, n_cols)
                         allocate(temp(ce - cb + 1))
                         ! loop over the map partition
                         do j = cb, ce 
@@ -209,7 +210,7 @@ contains
                         else
                             call MPI_Send( temp, ce - cb + 1, MPI_LOGICAL, dst, 0,  comm )
                         end if
-                        ! deallocate temp array
+                        ! deallocate temp
                         if (allocated( temp )) deallocate(temp)
                     end do
                 end do
@@ -224,55 +225,62 @@ contains
             end do
         end if
     end subroutine read_map
-
+    
     subroutine print_map(map, h, w)
         logical, dimension(:, :), pointer, intent(in) :: map
         integer, intent(in)                           :: h, w
-        character(len=:), allocatable :: line
-        logical,          allocatable :: temp(:)
-        integer :: i, j, rb, re, cb, ce
 
+        character(len=:), allocatable :: line        ! variable to hold a line
+        logical,          allocatable :: temp(:)     ! Temporary array to hold data for a column of the map
+        integer :: i, j, rb, re, cb, ce              ! indices for looping
+        
+        ! root starts printing
         if (my_rank == root) then
             block
-                integer :: current_row
-                integer :: current_col
-                integer :: dst
+                integer :: row_                     ! current row
+                integer :: col_                     ! current column
+                integer :: dst                      ! rank of the process in the current column
                 allocate(character(len=w) :: line)
 
-                do current_row = 0, n_rows - 1
-                    call partition(current_row, n_rows, h, rb, re)
+                ! loop over the rows
+                do row_ = 0, n_rows - 1
+                    call partition(row_, n_rows, h, rb, re) ! get row limits
+                    ! loop over the limits
                     do i = rb, re
-                        do current_col = 0, n_cols - 1
-                            call partition(current_col, n_cols, w, cb, ce)
+                        !loop over columns
+                        do col_ = 0, n_cols - 1
+                            call partition(col_, n_cols, w, cb, ce)  ! get column limits
                             allocate(temp(ce - cb + 1))
-                            dst = get_rank(current_row, current_col, n_rows, n_cols)
+                            dst = get_rank(row_, col_, n_rows, n_cols)
+                            
+                            ! if root, copy map
                             if (dst == root) then
                                 do j = cb, ce 
                                     line(j:j) = merge ( 'X', '.', map(i,j))
                                 end do
-                            else 
-                                call MPI_Recv(temp, ce-cb+1, MPI_LOGICAL, dst, 0, comm, status)
+                            ! if not root, recieve from rank
+                            else
+                                call MPI_Recv(temp, ce-cb+1, MPI_LOGICAL, dst, 0, MPI_COMM_WORLD, status)
                                 do j = cb, ce 
                                     line(j:j) = merge ( 'X', '.', temp(j-cb+1))
                                 end do
                             end if
-                            if (allocated( temp )) deallocate(temp)
+
+                            if (allocated( temp )) deallocate(temp)  ! deallocate temp
                         end do
-                        print "(a)", line
+                        print "(a)", line  ! print line
                     end do
                 end do
                 print *
-                if (allocated( line )) deallocate(line)
+                if (allocated( line )) deallocate(line)  ! deallocate line
             end block
-       else
-           do i = ib, ie
-               call MPI_Send( map(i, jb), 1, a_row, root, 0, comm)
-           end do
-       end if
-        
-
+        else  ! if not root, send to root
+            do i = ib, ie
+                call MPI_Send( map(i, jb), 1, a_row, root, 0, comm)
+            end do
+        end if    
     end subroutine print_map
-    
+
     subroutine next_gen(old_map, new_map)
         logical, dimension(:, :), pointer, intent(inout) :: old_map, new_map
         integer :: i, j
@@ -292,15 +300,16 @@ contains
     end subroutine next_gen
 
     ! Divides 2D grid in the closest to equal subgrids
-    subroutine partition( id, n_ids, size, b, e )
+    subroutine partition(id, n_ids, size, b, e)
         integer, intent(in)    :: id, n_ids, size
         integer, intent(inout) :: b, e
         integer :: remainder, quotient
 
-        remainder = modulo( size, n_ids )
+        remainder = modulo(size, n_ids)
         quotient  = (size - remainder) / n_ids
-        b = 1 + quotient * (id    ) + min( remainder, id     )
-        e =     quotient * (id + 1) + min( remainder, id + 1 )
+        b = 1 + quotient * (id    ) + min(remainder, id    )
+        e =     quotient * (id + 1) + min(remainder, id + 1)
+        return
     end subroutine partition
 
 end program game_of_life
