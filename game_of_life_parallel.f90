@@ -83,7 +83,7 @@ program game_of_life
         call update_borders(new_world)
         !aborting if world is still
         still_flag = world_is_still( old_world, new_world )
-        call MPI_Bcast(world_is_still( old_world, new_world ), 1, MPI_LOGICAL, root, comm)
+        call MPI_Bcast(still_flag, 1, MPI_LOGICAL, root, comm)
         if (still_flag) exit
         !swapping new map to old map
         tmp_world => old_world;  old_world => new_world;  new_world => tmp_world 
@@ -100,20 +100,7 @@ program game_of_life
 
 contains
 
-    function world_is_still( old_map, new_map ) result(still)
-        logical, dimension(:, :), pointer, intent(in)   :: old_map, new_map
-        logical                                         :: still
-        logical, dimension(n_ranks)                     :: all_is_still
-
-        still = all( old_map .eqv. new_map )
-        call MPI_Gather(still, 1, MPI_LOGICAL, all_is_still,   1, MPI_LOGICAL, root, comm)
-        if (my_rank == root) then
-            still = all ( all_is_still .eqv. .True.)
-        else
-            still = .false.
-        endif
-    end function world_is_still
-
+    ! Gives coordinates of the current rank
     subroutine get_coords( rank, n_rows, n_cols, row, col )
         integer, intent(in)    :: rank, n_rows, n_cols
         integer, intent(inout) :: row, col
@@ -129,7 +116,7 @@ contains
         end if
     end subroutine get_coords
 
-    
+    ! Gets the rank of a grid position
     integer function get_rank(row, col, n_rows, n_cols)
         integer, intent(in) :: row, col, n_rows, n_cols
         integer :: row_, col_
@@ -153,22 +140,20 @@ contains
         return
     end function get_rank
 
-    subroutine update_borders( map )
-        logical, dimension(:, :), pointer, intent(inout) :: map
-    
-        ! synchronize rows with north and south
-        call MPI_Sendrecv( map(ib,jb), 1, a_row, north_rank, 1, &
-                           map(ie+1,jb), 1, a_row, south_rank, 1, comm, status )
-        call MPI_Sendrecv( map(ie,jb), 1, a_row, south_rank, 2, &
-                           map(ib-1,jb), 1, a_row, north_rank, 2, comm, status )
-    
-        ! synchronize columns with east and west
-        call MPI_Sendrecv( map(ib-1,jb), 1, a_col, west_rank, 3, &
-                           map(ib-1,je+1), 1, a_col, east_rank, 3, comm, status )
-        call MPI_Sendrecv( map(ib-1,je), 1, a_col, east_rank, 4, &
-                           map(ib-1,jb-1), 1, a_col, west_rank, 4, comm, status )
-    end subroutine update_borders
-    
+    ! Divides 2D grid in subgrids
+    subroutine partition(id, n_ids, size, b, e)
+        integer, intent(in)    :: id, n_ids, size
+        integer, intent(inout) :: b, e
+        integer :: remainder, quotient
+
+        remainder = modulo(size, n_ids)
+        quotient  = (size - remainder) / n_ids
+        b = 1 + quotient * (id    ) + min(remainder, id    )
+        e =     quotient * (id + 1) + min(remainder, id + 1)
+        return
+    end subroutine partition
+
+    ! Reads 2D grid and distributes it
     subroutine read_map( map, h, w )
         logical, dimension(:, :), pointer, intent(inout) :: map
         integer, intent(in) :: h, w
@@ -225,7 +210,25 @@ contains
             end do
         end if
     end subroutine read_map
+
+    ! Updates ghost layers around rank subgrids
+    subroutine update_borders( map )
+        logical, dimension(:, :), pointer, intent(inout) :: map
     
+        ! synchronize rows with north and south
+        call MPI_Sendrecv( map(ib,jb), 1, a_row, north_rank, 1, &
+                           map(ie+1,jb), 1, a_row, south_rank, 1, comm, status )
+        call MPI_Sendrecv( map(ie,jb), 1, a_row, south_rank, 2, &
+                           map(ib-1,jb), 1, a_row, north_rank, 2, comm, status )
+    
+        ! synchronize columns with east and west
+        call MPI_Sendrecv( map(ib-1,jb), 1, a_col, west_rank, 3, &
+                           map(ib-1,je+1), 1, a_col, east_rank, 3, comm, status )
+        call MPI_Sendrecv( map(ib-1,je), 1, a_col, east_rank, 4, &
+                           map(ib-1,jb-1), 1, a_col, west_rank, 4, comm, status )
+    end subroutine update_borders
+
+    ! Prints full 2D grid map
     subroutine print_map(map, h, w)
         logical, dimension(:, :), pointer, intent(in) :: map
         integer, intent(in)                           :: h, w
@@ -281,6 +284,7 @@ contains
         end if    
     end subroutine print_map
 
+    ! Iterates next generation
     subroutine next_gen(old_map, new_map)
         logical, dimension(:, :), pointer, intent(inout) :: old_map, new_map
         integer :: i, j
@@ -299,17 +303,19 @@ contains
         return
     end subroutine next_gen
 
-    ! Divides 2D grid in the closest to equal subgrids
-    subroutine partition(id, n_ids, size, b, e)
-        integer, intent(in)    :: id, n_ids, size
-        integer, intent(inout) :: b, e
-        integer :: remainder, quotient
+    ! Checks if the state of the world is the same as last iteration
+    function world_is_still( old_map, new_map ) result(still)
+        logical, dimension(:, :), pointer, intent(in)   :: old_map, new_map
+        logical                                         :: still
+        logical, dimension(n_ranks)                     :: all_is_still
 
-        remainder = modulo(size, n_ids)
-        quotient  = (size - remainder) / n_ids
-        b = 1 + quotient * (id    ) + min(remainder, id    )
-        e =     quotient * (id + 1) + min(remainder, id + 1)
-        return
-    end subroutine partition
+        still = all( old_map .eqv. new_map )
+        call MPI_Gather(still, 1, MPI_LOGICAL, all_is_still,   1, MPI_LOGICAL, root, comm)
+        if (my_rank == root) then
+            still = all ( all_is_still .eqv. .True.)
+        else
+            still = .false.
+        endif
+    end function world_is_still
 
 end program game_of_life
